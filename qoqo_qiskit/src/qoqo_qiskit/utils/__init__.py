@@ -16,4 +16,4 @@ from qoqo_qiskit.utils.utils import (
     get_qoqo_noise_models_from_aer_noise_model,
 )
 
-__all__ = ["struqture_hamiltonian_to_qiskit_op", "get_qoqo_noise_models_from_aer_noise_model"]
+__all__ = ["get_qoqo_noise_models_from_aer_noise_model", "struqture_hamiltonian_to_qiskit_op"]
