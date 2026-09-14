@@ -2,6 +2,12 @@
 
 This changelog tracks changes of the qoqo_qiskit project starting at version 0.1.0 (initial release).
 
+## 0.12.0
+
+### Updated in 0.12.0
+
+* Added the `get_qoqo_noise_models_from_aer_noise_model` function.
+
 ## 0.11.0
 
 ### Updated in 0.11.0

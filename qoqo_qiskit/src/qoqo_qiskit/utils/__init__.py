@@ -11,6 +11,9 @@
 # the License.
 """Qoqo-qiskit utils modules for compatibility purposes."""
 
-from qoqo_qiskit.utils.utils import struqture_hamiltonian_to_qiskit_op
+from qoqo_qiskit.utils.utils import (
+    struqture_hamiltonian_to_qiskit_op,
+    get_qoqo_noise_models_from_aer_noise_model,
+)
 
-__all__ = ["struqture_hamiltonian_to_qiskit_op"]
+__all__ = ["struqture_hamiltonian_to_qiskit_op", "get_qoqo_noise_models_from_aer_noise_model"]

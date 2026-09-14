@@ -15,9 +15,12 @@ import re
 from typing import TYPE_CHECKING
 
 from qiskit.quantum_info.operators import SparsePauliOp
+from qiskit_aer.noise import NoiseModel
+from qoqo.noise_models import DecoherenceOnGateModel
+from struqture_py.spins import PlusMinusLindbladNoiseOperator, PlusMinusProduct
 
 if TYPE_CHECKING:
-    from struqture_py.spins import PauliHamiltonian  # type:ignore
+    from struqture_py.spins import PauliHamiltonian  # type: ignore
 
 
 def struqture_hamiltonian_to_qiskit_op(
@@ -57,3 +60,72 @@ def struqture_hamiltonian_to_qiskit_op(
         coeffs.append(complex(val))
 
     return SparsePauliOp(labels, coeffs)
+
+
+def get_qoqo_noise_models_from_aer_noise_model(
+    noisemodel: NoiseModel,
+) -> DecoherenceOnGateModel:
+    """Convert simple Aer qerror entries into a qoqo DecoherenceOnGateModel.
+
+    Assumptions:
+    - only handles entries of type "qerror"
+    - expects explicit gate_qubits
+    - treats the error as a simple Pauli-like gate noise
+    - uses p = sum(non-identity probabilities) as effective noise strength
+    """
+
+    def _map_gate_name(gate: str) -> str:
+        mapping = {
+            "x": "PauliX",
+            "y": "PauliY",
+            "z": "PauliZ",
+            "rx": "RotateX",
+            "ry": "RotateY",
+            "rz": "RotateZ",
+            "sx": "SqrtPauliX",
+            "cx": "CNOT",
+            "id": "Identity",
+            "crx": "ControlledRotateX",
+        }
+        return mapping.get(gate, gate)
+
+    model = DecoherenceOnGateModel()
+    noise_dict = noisemodel.to_dict(serializable=True)
+
+    for error in noise_dict["errors"]:
+        if error["type"] != "qerror":
+            continue
+        if "gate_qubits" not in error:
+            continue
+
+        gate = _map_gate_name(error["operations"][0])
+        qubits = tuple(error["gate_qubits"][0])
+
+        p = 0.0
+        for instruction_list, prob in zip(
+            error["instructions"], error["probabilities"], strict=False
+        ):
+            inst = instruction_list[0]
+
+            if inst["name"] == "id":
+                continue
+
+            if inst["name"] == "pauli" and set(inst["params"][0]) == {"I"}:
+                continue
+
+            p += float(prob)
+
+        lindblad_noise = PlusMinusLindbladNoiseOperator()
+        for qubit in qubits:
+            for op, factor in [("+", 0.5), ("-", 0.5), ("Z", 0.25)]:
+                dp = PlusMinusProduct().from_string(f"{qubit}{op}")
+                lindblad_noise.add_operator_product((dp, dp), factor * p)
+
+        if len(qubits) == 1:
+            model = model.set_single_qubit_gate_error(gate, qubits[0], lindblad_noise)
+        elif len(qubits) == 2:
+            model = model.set_two_qubit_gate_error(gate, qubits[0], qubits[1], lindblad_noise)
+        else:
+            model = model.set_multi_qubit_gate_error(gate, qubits, lindblad_noise)
+
+    return model

@@ -14,8 +14,14 @@
 import pytest
 import sys
 
-from qoqo_qiskit.utils import struqture_hamiltonian_to_qiskit_op
-from struqture_py.spins import PauliHamiltonian, PauliProduct  # type:ignore
+from qoqo_qiskit.utils import (
+    struqture_hamiltonian_to_qiskit_op,
+    get_qoqo_noise_models_from_aer_noise_model,
+)
+from struqture_py.spins import PauliHamiltonian, PauliProduct  # type: ignore
+from qiskit_aer.noise import NoiseModel, pauli_error
+from qoqo.noise_models import DecoherenceOnGateModel
+from struqture_py.spins import PlusMinusProduct, PlusMinusLindbladNoiseOperator
 
 
 def test_basic_hamiltonian() -> None:
@@ -44,6 +50,32 @@ def test_big_hamiltonian() -> None:
 
     assert res.num_qubits == 13
     assert res.to_list() == [("IYZXYZXYZXYZX", (0.5 + 0j)), ("XIIIIIIIIIIII", (0.25 + 0j))]
+
+
+def test_converts_single_qubit_aer_qerror_to_qoqo_noise_model():
+    # Aer error: identity with 90% probability, X error with 10%.
+    aer_noise_model = NoiseModel()
+    aer_noise_model.add_quantum_error(
+        pauli_error([("I", 0.9), ("X", 0.1)]),
+        instructions=["x"],
+        qubits=[0],
+    )
+
+    model = get_qoqo_noise_models_from_aer_noise_model(aer_noise_model)
+
+    expected_noise = PlusMinusLindbladNoiseOperator()
+    for op, factor in [("+", 0.5), ("-", 0.5), ("Z", 0.25)]:
+        product = PlusMinusProduct().from_string(f"0{op}")
+        expected_noise.add_operator_product((product, product), factor * 0.1)
+
+    expected_model = DecoherenceOnGateModel()
+    expected_model = expected_model.set_single_qubit_gate_error(
+        "PauliX",
+        0,
+        expected_noise,
+    )
+
+    assert model == expected_model
 
 
 # For pytest
