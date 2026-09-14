@@ -68,8 +68,7 @@ def get_qoqo_noise_models_from_aer_noise_model(
     """Convert simple Aer qerror entries into a qoqo DecoherenceOnGateModel.
 
     Assumptions:
-    - only handles entries of type "qerror"
-    - expects explicit gate_qubits
+    - only handles entries of type "qerror" which contains all the errors related to quantum gates
     - treats the error as a simple Pauli-like gate noise
     - uses p = sum(non-identity probabilities) as effective noise strength
     """
@@ -107,10 +106,9 @@ def get_qoqo_noise_models_from_aer_noise_model(
         ):
             inst = instruction_list[0]
 
-            if inst["name"] == "id":
-                continue
-
-            if inst["name"] == "pauli" and set(inst["params"][0]) == {"I"}:
+            if inst["name"] == "id" or (
+                inst["name"] == "pauli" and set(inst["params"][0]) == {"I"}
+            ):
                 continue
 
             p += float(prob)
