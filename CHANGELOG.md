@@ -4,9 +4,15 @@ This changelog tracks changes of the qoqo_qiskit project starting at version 0.1
 
 ## 0.12.0
 
+<<<<<<< HEAD
 ### Updated in 0.12.0
 
 * Added the `get_qoqo_noise_models_from_aer_noise_model` function.
+=======
+### Added in 0.12.0
+
+* Added `run_pauli_operator` and `measure_pauli_operator`.
+>>>>>>> upstream/main
 
 ## 0.11.0
 
