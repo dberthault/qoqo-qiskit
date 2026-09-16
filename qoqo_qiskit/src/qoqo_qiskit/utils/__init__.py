@@ -11,6 +11,26 @@
 # the License.
 """Qoqo-qiskit utils modules for compatibility purposes."""
 
-from qoqo_qiskit.utils.utils import struqture_hamiltonian_to_qiskit_op
+from qoqo_qiskit.utils.utils import (
+    _basis_rotation_from_z_basis,
+    _collect_pauli_products,
+    _single_measurement_circuit,
+    _sort_by_length,
+    _sort_pauli_operator,
+    _z_label_from_pauli_product,
+    measure_pauli_operator,
+    run_pauli_operator,
+    struqture_hamiltonian_to_qiskit_op,
+)
 
-__all__ = ["struqture_hamiltonian_to_qiskit_op"]
+__all__ = [
+    "_basis_rotation_from_z_basis",
+    "_collect_pauli_products",
+    "_single_measurement_circuit",
+    "_sort_by_length",
+    "_sort_pauli_operator",
+    "_z_label_from_pauli_product",
+    "measure_pauli_operator",
+    "run_pauli_operator",
+    "struqture_hamiltonian_to_qiskit_op",
+]

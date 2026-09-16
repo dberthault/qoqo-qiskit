@@ -2,6 +2,12 @@
 
 This changelog tracks changes of the qoqo_qiskit project starting at version 0.1.0 (initial release).
 
+## 0.12.0
+
+### Added in 0.12.0
+
+* Added `run_pauli_operator` and `measure_pauli_operator`.
+
 ## 0.11.0
 
 ### Updated in 0.11.0

@@ -12,16 +12,22 @@
 """Qoqo-qiskit utils modules for compatibility purposes."""
 
 import re
-from typing import TYPE_CHECKING
+from typing import Dict, List, Optional, Tuple
 
+import numpy as np
+from qiskit import ClassicalRegister, QuantumCircuit
 from qiskit.quantum_info.operators import SparsePauliOp
+from qiskit_aer.primitives import SamplerV2
+from qoqo import Circuit
+from struqture_py.spins import PauliHamiltonian, PauliOperator, PauliProduct  # type: ignore
 
-if TYPE_CHECKING:
-    from struqture_py.spins import PauliHamiltonian  # type:ignore
+from qoqo_qiskit.interface import to_qiskit_circuit
+
+_TOKEN_RE = re.compile(r"(\d+)([XYZ])")
 
 
 def struqture_hamiltonian_to_qiskit_op(
-    pauli_hamiltonian: "PauliHamiltonian",
+    pauli_hamiltonian: PauliHamiltonian,
     n_qubits: int,
     reverse_qubit_order: bool = True,
 ) -> SparsePauliOp:
@@ -47,6 +53,7 @@ def struqture_hamiltonian_to_qiskit_op(
             for m in token_re.finditer(s):
                 idx = int(m.group(1))  # site index (can be multi-digit)
                 op = m.group(2)  # 'X', 'Y', or 'Z'
+                # indexing due to endianness:
                 q = (n_qubits - 1 - idx) if reverse_qubit_order else idx
                 if not (0 <= q < n_qubits):
                     raise IndexError(
@@ -57,3 +64,356 @@ def struqture_hamiltonian_to_qiskit_op(
         coeffs.append(complex(val))
 
     return SparsePauliOp(labels, coeffs)
+
+
+def run_pauli_operator(
+    input_circuit: Circuit,
+    input_operator: PauliOperator,
+    name: str,
+    undo_basis_rotation: bool,
+    constant_circuit: Optional[Circuit] = None,
+    number_measurements: Optional[int] = None,
+    qubit_mapping: Optional[dict[int, int]] = None,
+    creg_length: Optional[int] = None,
+) -> Tuple[
+    List[QuantumCircuit],
+    List[List[str]],
+    Dict[PauliProduct, float],
+]:
+    """Build and execute measurement circuits for a PauliOperator.
+
+    Args:
+        input_circuit (Circuit): State-preparation circuit.
+        input_operator (PauliOperator): Operator to measure.
+        name (str): Base name for generated classical registers.
+        undo_basis_rotation (bool): Whether to undo basis rotations after measurement.
+        constant_circuit (Optional[Circuit]): Optional circuit executed before input_circuit.
+        number_measurements (Optional[int]): Number of shots to execute.
+        qubit_mapping (Optional[dict[int, int]]): Optional qubit mapping.
+        creg_length (Optional[int]): Optional generated classical-register length.
+
+    Returns:
+        Tuple[List[QuantumCircuit], List[List[str]], Dict[PauliProduct, float]]:
+            Executed circuits, shot bitstrings for each circuit, and individual
+            term expectation values.
+
+    Raises:
+        ValueError: The number of measurements is negative or the preparation circuit
+            requires more qubits than the generated measurement circuits.
+    """
+    if number_measurements is not None and number_measurements < 0:
+        raise ValueError("The number of measurements cannot be negative.")
+
+    circuits, op_terms, _ = measure_pauli_operator(
+        input_operator,
+        name,
+        undo_basis_rotation,
+        qubit_mapping,
+        creg_length,
+    )
+
+    if not circuits:
+        return [], [], {}
+
+    preparation_circuit = (
+        input_circuit if constant_circuit is None else constant_circuit + input_circuit
+    )
+    qiskit_circuit, _ = to_qiskit_circuit(preparation_circuit, None)
+
+    for circuit in circuits:
+        if qiskit_circuit.num_qubits > circuit.num_qubits:
+            raise ValueError(
+                "The preparation circuit requires more qubits than the measurement circuit."
+            )
+        circuit.compose(
+            qiskit_circuit,
+            qubits=range(qiskit_circuit.num_qubits),
+            front=True,
+            inplace=True,
+        )
+
+    sampler = SamplerV2()
+    shots = number_measurements if number_measurements is not None else sampler.default_shots
+    res = sampler.run(circuits, shots=shots).result()
+
+    all_shots: list[list[str]] = []
+    term_expectations: dict[PauliProduct, float] = {}
+
+    for i, pub_res in enumerate(res):
+        bit_array = (
+            pub_res.join_data()
+        )  # BitArray ([docs.quantum.ibm.com](https://docs.quantum.ibm.com/api/qiskit/qiskit.primitives.SamplerPubResult))
+        n_bits = bit_array.num_bits
+
+        # per-shot samples (strings like "0101..."); length == shots
+        shots_i = bit_array.get_bitstrings()
+        all_shots.append(shots_i)
+
+        # Build diagonal observables (I/Z only) for each term in this group.
+        obs = [
+            _z_label_from_pauli_product(k, n_bits, qubit_mapping=qubit_mapping)
+            for k in op_terms[i]
+        ]
+
+        # Vector of <P_k> for this group; returns real floats for diagonal observables.
+        expvals = np.asarray(bit_array.expectation_values(obs), dtype=float)
+
+        # Store per-term expectations
+        for k, ev in zip(op_terms[i], expvals, strict=False):
+            term_expectations[k] = float(ev)
+    return circuits, all_shots, term_expectations
+
+
+def measure_pauli_operator(
+    input_operator: PauliOperator,
+    name: str,
+    undo_basis_rotation: bool,
+    qubit_mapping: Optional[dict[int, int]] = None,
+    creg_length: Optional[int] = None,
+) -> Tuple[
+    List[QuantumCircuit],
+    List[List[PauliProduct]],
+    List[List[complex]],
+]:
+    """Create optimized Pauli-Z-basis measurement circuits for a PauliOperator.
+
+    Groups measurement-compatible Pauli products and creates one circuit for
+    each group.
+
+    Args:
+        input_operator (PauliOperator): The struqture_py.spins.PauliOperator instance.
+        name (str): Name for the measurement circuit.
+        undo_basis_rotation (bool): Whether to append operations undoing basis rotations or not.
+        qubit_mapping (Optional[dict[int, int]]): Optional qubit mapping to apply to
+            the measurement circuit.
+        creg_length (Optional[int]): Optional length of the ClassicalRegister instance.
+
+    Returns:
+        Tuple[List[QuantumCircuit], List[List[PauliProduct]], List[List[complex]]]:
+            The measurement circuits, the Pauli products grouped by circuit,
+            and the corresponding complex coefficients grouped by circuit.
+
+    Raises:
+        ValueError: If `creg_length` is smaller than the number of spins in
+            `input_operator`.
+    """
+    if creg_length is not None and creg_length < input_operator.current_number_spins():
+        raise ValueError(f"The number of spins in the operators passed is \
+            {input_operator.current_number_spins()}. The length of the \
+            DefinitionBit input is {creg_length}, which is smaller. \
+            The measurement can therefore not be constructed.")
+
+    operators: List[PauliOperator] = _sort_pauli_operator(input_operator)
+    circuits: List[QuantumCircuit] = []
+    operators_terms: List[List[PauliProduct]] = []
+    operators_coeffs: List[List[complex]] = []
+
+    for i, po in enumerate(operators):
+        terms = po.keys()
+        coeffs = po.values()
+        circuit = _single_measurement_circuit(
+            po.keys(),
+            f"{name}_{i}",
+            undo_basis_rotation,
+            qubit_mapping,
+            input_operator.current_number_spins(),
+            creg_length,
+        )
+        circuits.append(circuit)
+        operators_terms.append(terms)
+        operators_coeffs.append(coeffs)
+
+    return (circuits, operators_terms, operators_coeffs)
+
+
+def _sort_pauli_operator(input_operator: PauliOperator) -> List[PauliOperator]:
+    """Split a PauliOperator object into measurement-compatible PauliProducts."""
+    output_ops: List[PauliOperator] = []
+    sorted_keys = _sort_by_length(input_operator)
+
+    while sorted_keys:
+        new_op = PauliOperator()
+        new_sorted = []
+
+        first = sorted_keys.pop(0)
+        new_op.set(first, input_operator.get(first))
+
+        for pp in list(sorted_keys):
+            incompatible_with_group = any(
+                _pauli_products_are_not_measurement_compatible(existing_pp, pp)
+                for existing_pp in new_op.keys()
+            )
+            if not incompatible_with_group:
+                new_op.set(pp, input_operator.get(pp))
+            else:
+                new_sorted.append(pp)
+
+        sorted_keys = new_sorted
+        output_ops.append(new_op)
+
+    return output_ops
+
+
+def _single_measurement_circuit(
+    pauli_products: List[PauliProduct],
+    readout_register: str,
+    undo_basis_rotation: bool,
+    qubit_mapping: Optional[Dict[int, int]],
+    number_qubits: int,
+    creg_length: Optional[int],
+) -> QuantumCircuit:
+    mapping = qubit_mapping if qubit_mapping is not None else {}
+    circuit = QuantumCircuit(number_qubits)
+    creg_length = creg_length if creg_length is not None else number_qubits
+    creg = ClassicalRegister(creg_length, readout_register)
+    circuit.add_register(creg)
+
+    _basis_rotation_from_z_basis(circuit, pauli_products, mapping)
+
+    circuit.measure(range(number_qubits), creg)
+
+    if undo_basis_rotation:
+        _basis_rotation_to_z_basis(circuit, pauli_products, mapping)
+
+    return circuit
+
+
+def _basis_rotation_from_z_basis(
+    circuit: QuantumCircuit,
+    pauli_products: List[PauliProduct],
+    qubit_mapping: Optional[Dict[int, int]],
+) -> QuantumCircuit:
+    """Append basis-rotation gates that map X/Y eigenstates onto the Z basis before measurement."""
+    collected_pauli_products, _ = _collect_pauli_products(pauli_products)
+
+    mapping = qubit_mapping if qubit_mapping is not None else {}
+
+    for qbt in collected_pauli_products.keys():
+        pauli_str = collected_pauli_products.get(qbt)
+        qubit = mapping[qbt] if qbt in mapping else qbt
+        if pauli_str == "X":
+            circuit.ry(-np.pi / 2, qubit)
+        elif pauli_str == "Y":
+            circuit.rx(np.pi / 2, qubit)
+    return circuit
+
+
+def _basis_rotation_to_z_basis(
+    circuit: QuantumCircuit,
+    pauli_products: List[PauliProduct],
+    qubit_mapping: Optional[Dict[int, int]],
+) -> QuantumCircuit:
+    """Append inverse basis-rotation gates after measurement.
+
+    It reverses the rotations applied by ``_basis_rotation_from_z_basis``.
+    """
+    collected_pauli_products, _ = _collect_pauli_products(pauli_products)
+
+    mapping = qubit_mapping if qubit_mapping is not None else {}
+
+    for qbt in collected_pauli_products.keys():
+        pauli_str = collected_pauli_products.get(qbt)
+        qubit = mapping[qbt] if qbt in mapping else qbt
+        if pauli_str == "X":
+            circuit.ry(np.pi / 2, qubit)
+        elif pauli_str == "Y":
+            circuit.rx(-np.pi / 2, qubit)
+    return circuit
+
+
+def _collect_pauli_products(pauli_products: List[PauliProduct]) -> Tuple[PauliProduct, int]:
+    for i, pp_left in enumerate(pauli_products):
+        for ppright in pauli_products[i + 1 :]:
+            if _pauli_products_are_not_measurement_compatible(pp_left, ppright):
+                raise ValueError("Pauli products are not measurement compatible.")
+    collected_pauli_products = PauliProduct()
+    for pp in pauli_products:
+        for key in pp.keys():
+            collected_pauli_products = collected_pauli_products.set_pauli(key, pp.get(key))
+    if len(collected_pauli_products.keys()) == 0:
+        max_length = 1
+    else:
+        max_length = max(collected_pauli_products.keys()) + 1
+    return (collected_pauli_products, max_length)
+
+
+def _sort_by_length(op: PauliOperator) -> List:
+    """Return op.keys() ordered then reversed.
+
+    Rust's Ord for PauliProduct is "by length then content" (effectively).
+    Here we emulate with: (length, string) ascending, then reverse.
+    """
+    keys = op.keys()
+    keys.sort(key=lambda pp: (_pp_length(pp), str(pp)))
+    keys.reverse()
+    return keys
+
+
+def _pauli_products_are_not_measurement_compatible(pp_a: str, pp_b: str) -> bool:
+    """Returns True iff the two PauliProducts are NOT measurement compatible.
+
+    It works under the "single-qubit basis rotation then Z-measurement" model.
+    Incompatible if there exists a qubit where both have non-identity Paulis
+    and they differ (e.g., X vs Z).
+
+    Example: X0Z1 and X0Z1Z3 are compatible, in that they never assign different
+    non-identiy Paulis to the same qubit. X0Z1 and Y0Z1 are for that reason not compatible.
+    They require different basis rotations so they must be measured in separate circuits.
+    """
+    a = _pp_to_local_map(pp_a)
+    b = _pp_to_local_map(pp_b)
+    for q in set(a.keys()) | set(b.keys()):
+        pa = a.get(q, "I")
+        pb = b.get(q, "I")
+        if pa != "I" and pb != "I" and pa != pb:
+            return True
+    return False
+
+
+def _pp_length(pp: str) -> int:
+    """Number of non-identity factors (weight of the Pauli string)."""
+    return len(_pp_to_local_map(pp))
+
+
+def _pp_to_local_map(pp: str) -> Dict[int, str]:
+    """Convert a PauliProduct into a dict {qubit_index: 'X'|'Y'|'Z'}.
+
+    Identity on a qubit is represented by absence from the dict.
+    """
+    s = str(pp).strip()
+    if s in ("", "I"):  # tolerate empty / identity representations
+        return {}
+    out: Dict[int, str] = {}
+    for q_str, p in _TOKEN_RE.findall(s):
+        out[int(q_str)] = p
+    return out
+
+
+def _z_label_from_pauli_product(
+    pauli_product: PauliProduct,
+    n: int,
+    qubit_mapping: Optional[dict[int, int]] = None,
+) -> str:
+    """Build a *diagonal* observable label ('I'/'Z' only) of length n.
+
+    Assuming the circuit already rotated X/Y -> Z before measuring.
+    Qiskit label convention: rightmost char = qubit 0.
+    BitArray convention: bit index 0 is least-significant/rightmost. ([docs.quantum.ibm.com](https://docs.quantum.ibm.com/api/qiskit/qiskit.primitives.BitArray))
+    """
+    label = ["I"] * n
+    mapping = qubit_mapping if qubit_mapping is not None else {}
+
+    # This assumes your PauliProduct iterates like: for (q, op) in pauli_product
+    # where op is something like "X","Y","Z" (or an enum).
+    for qbt in pauli_product.keys():
+        pauli_str = pauli_product.get(qbt)
+        qubit = mapping[qbt] if qbt in mapping else qbt
+        if pauli_str == "I":
+            continue
+        if not (0 <= qubit < n):
+            raise ValueError(f"Mapped qubit index {qubit} out of range for n={n}")
+
+        # Put 'Z' on measured qubit position (indexing is due to endianness).
+        label[n - 1 - qubit] = "Z"
+
+    return "".join(label)
